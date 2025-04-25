@@ -1,3 +1,132 @@
+# Re-save the full pipeline script with DBFS-safe logging
+
+full_pipeline_code = """
+# Sagility Transcript Pipeline with DBFS-safe logging
+
+import os
+import shutil
+from zipfile import ZipFile
+from datetime import datetime
+from pyspark.sql.functions import current_date, lit, col, when, count, sum, to_date
+
+# 1. Config and Setup
+processing_start_time_sagility = datetime.now()
+
+source_directory_sagility = "/Volumes/prod_adb/default/synapse_volume/raw/surveyspeechextraction/Sagility/"
+target_directory_sagility = "/Volumes/dbc_adv_anlaytics_dev/surveyspeechextraction/call_intent_workspace/common_filter/"
+
+folder_to_execute = datetime.now().strftime("%Y-%m-%d")
+workspace_path = target_directory_sagility
+
+folders = ["IFP", "Provider", "Core Premier"]
+paths = {}
+
+for folder in folders:
+    paths[folder] = {
+        "to_process_path": os.path.join(workspace_path, folder, folder_to_execute, "to_process", "Sagility"),
+        "op_file_path": os.path.join(workspace_path, folder, folder_to_execute, "output", "Sagility"),
+        "archive_path": os.path.join(workspace_path, folder, folder_to_execute, "archive", "Sagility"),
+        "log_file_path": os.path.join(workspace_path, folder, folder_to_execute, "logs", "Sagility")
+    }
+
+raw_unzip_path = os.path.join(workspace_path, "raw_unzip_files", folder_to_execute)
+original_zip_files = os.path.join(workspace_path, "original_zip_files", folder_to_execute)
+
+for subfolders in paths.values():
+    for subfolder_path in subfolders.values():
+        os.makedirs(subfolder_path, exist_ok=True)
+os.makedirs(raw_unzip_path, exist_ok=True)
+os.makedirs(original_zip_files, exist_ok=True)
+
+# 2. Identify new files
+processed_log_path = os.path.join(target_directory_sagility, "processed_files.txt")
+log_file_path = f"/dbfs{processed_log_path}" if not processed_log_path.startswith("/dbfs/") else processed_log_path
+
+processed_files = set()
+if os.path.exists(log_file_path):
+    with open(log_file_path, 'r') as f:
+        processed_files = {line.strip() for line in f}
+else:
+    with open(log_file_path, 'w') as f:
+        pass
+
+all_zip_files = [f for f in os.listdir(source_directory_sagility) if f.endswith(".zip")]
+new_zip_files = [f for f in all_zip_files if f not in processed_files]
+
+# 3. Process and unzip new files
+for file in new_zip_files:
+    full_path = os.path.join(source_directory_sagility, file)
+    try:
+        print(f"Processing file: {file}")
+        shutil.copy(full_path, original_zip_files)
+        with ZipFile(full_path, 'r') as zip_ref:
+            zip_ref.extractall(raw_unzip_path)
+        with open(log_file_path, 'a') as log_file:
+            log_file.write(f"{file}\\n")
+        processed_files.add(file)
+    except Exception as e:
+        print(f"Failed to process {file}: {e}")
+
+sagility_unzip_path = raw_unzip_path
+
+# 4. Run Global Filter
+from Unzip_Filter import global_filter_sagility
+huntgroup_excel_path = "./ALL_LOB_Skill_IDS.xlsx"
+
+try:
+    global_filter_sagility(sagility_unzip_path, folder_to_execute, huntgroup_excel_path, paths)
+except Exception as e:
+    print(f"Error during global filtering: {e}")
+
+# 5. Log Processing Info
+processing_end_time_sagility = datetime.now()
+
+CATALOG_NAME = 'dbc_adv_anlaytics_dev'
+SCHEMA_NAME = 'surveyspeechextraction'
+ETL_LOG_TABLE = 'Daily_Transcript_Logs'
+
+def update_daily_transcript_logs(metadata_table_name, processing_start_time, processing_end_time):
+    try:
+        metadata_table = spark.table(metadata_table_name)
+        filtered_metadata = metadata_table.filter(
+            (metadata_table.CII_Source.like('%Sagility%')) &
+            (to_date(metadata_table.CII_Current_date) == current_date())
+        )
+        columns = metadata_table.columns
+        outbound_calls_expr = sum(when(col("Direction") == 2, 1).otherwise(0)).alias("Outbound_Calls_Count") if "Direction" in columns else lit(0).alias("Outbound_Calls_Count")
+        inbound_calls_expr = sum(when(col("Direction") == 1, 1).otherwise(0)).alias("Inbound_Calls_Count") if "Direction" in columns else lit(0).alias("Inbound_Calls_Count")
+        skill_id_present_expr = sum(when(col("CD10").isNotNull(), 1).otherwise(0)).alias("Skill_ID_Present") if "CD10" in columns else lit(0).alias("Skill_ID_Present")
+        queue_name_present_expr = sum(when(col("CD69").isNotNull(), 1).otherwise(0)).alias("Queue_Name_Present") if "CD69" in columns else lit(0).alias("Queue_Name_Present")
+        member_id_present_expr = sum(when((col("CD48_Member_ID").isNotNull()) | (col("CD93_Subscriber_ID").isNotNull()) | (col("CD6_Subscriber_ID").isNotNull()), 1).otherwise(0)).alias("Member_ID_Present") if any(col in columns for col in ["CD48_Member_ID", "CD93_Subscriber_ID", "CD6_Subscriber_ID"]) else lit(0).alias("Member_ID_Present")
+        length_more_than_60_seconds_expr = sum(when(col("Duration_in_sec") > 60, 1).otherwise(0)).alias("Length_More_Than_60Seconds") if "Duration_in_sec" in columns else lit(0).alias("Length_More_Than_60Seconds")
+        lob_counts = filtered_metadata.groupBy("CII_Selected_LOB", "CII_Current_date").agg(
+            count("*").alias("Total_Transcript_Count"),
+            outbound_calls_expr,
+            inbound_calls_expr,
+            skill_id_present_expr,
+            queue_name_present_expr,
+            member_id_present_expr,
+            length_more_than_60_seconds_expr
+        )
+        lob_counts = lob_counts.withColumn("Date_Created", current_date()) \
+            .withColumn("Global_Filter_Start_Datetime", lit(processing_start_time)) \
+            .withColumn("Global_Filter_End_Datetime", lit(processing_end_time)) \
+            .withColumn("Vendor_Information", lit("Sagility"))
+        lob_counts.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(f"{CATALOG_NAME}.{SCHEMA_NAME}.{ETL_LOG_TABLE}")
+    except Exception as e:
+        print(f"An error occurred in logging: {e}")
+
+update_daily_transcript_logs("metadata_table", processing_start_time_sagility, processing_end_time_sagility)
+"""
+
+file_path = "/mnt/data/sagility_pipeline_dbfs_safe.py"
+with open(file_path, "w") as f:
+    f.write(full_pipeline_code)
+
+file_path
+
+
+
 
 # Sagility Transcript Pipeline (Databricks-compatible Python script)
 
