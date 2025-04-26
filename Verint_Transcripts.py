@@ -1,4 +1,107 @@
 
+import os, shutil
+from datetime import datetime
+from zipfile import ZipFile
+from Unzip_Filter import global_filter
+import json
+
+# Configuration
+source_directory_verint = "/Volumes/prod_adb/default/ext-data-volume-stmlz/surveyspeechextraction/Call_Transcripts/2025_verint_transcripts/"
+target_directory_verint = "/Volumes/dbc_adv_anlaytics_dev/surveyspeechextraction/call_intent_workspace/common_filter/"
+processed_log_file = os.path.join(target_directory_verint, "processed_folders.txt")
+
+# LOB folders
+folders = ["MA", "IFP", "Broker", "Small Group", "MediCal", "Core Premier"]
+
+# Ensure target/log file exists
+os.makedirs(target_directory_verint, exist_ok=True)
+if not os.path.exists(processed_log_file):
+    open(processed_log_file, 'w').close()
+
+# Load processed folders
+processed_folders = set()
+with open(processed_log_file, 'r') as log:
+    for line in log:
+        processed_folders.add(line.strip())
+
+# Detect new date folders
+all_folders = sorted([f for f in os.listdir(source_directory_verint) if f.startswith("2025-")])
+new_folders = [f for f in all_folders if f not in processed_folders]
+
+def timestamp_prefix():
+    return datetime.now().strftime('%Y%m%dT%H%M%S%f')[:-3]
+
+processing_start_time = datetime.now()
+
+for folder_to_execute in new_folders:
+    print(f"Processing folder: {folder_to_execute}")
+    src_path = os.path.join(source_directory_verint, folder_to_execute)
+    workspace_path = os.path.join(target_directory_verint, folder_to_execute)
+
+    if os.path.exists(workspace_path):
+        shutil.rmtree(workspace_path)
+    os.makedirs(workspace_path, exist_ok=True)
+
+    # Create standard paths
+    paths = {}
+    for folder in folders:
+        folder_path = os.path.join(workspace_path, folder, folder_to_execute)
+        paths[folder] = {
+            "to_process_path": os.path.join(folder_path, "to_process", "Verint"),
+            "op_file_path": os.path.join(folder_path, "output", "Verint"),
+            "archive_path": os.path.join(folder_path, "archive", "Verint"),
+            "log_file_path": os.path.join(folder_path, "logs", "Verint")
+        }
+        for path in paths[folder].values():
+            os.makedirs(path, exist_ok=True)
+
+    # Unzip files
+    raw_unzip_path = os.path.join(workspace_path, "raw_unzip_files", folder_to_execute)
+    original_zip_path = os.path.join(workspace_path, "original_zip_files", folder_to_execute)
+    os.makedirs(raw_unzip_path, exist_ok=True)
+    os.makedirs(original_zip_path, exist_ok=True)
+
+    zip_files = [z for z in os.listdir(src_path) if z.endswith(".zip")]
+    for zip_file in zip_files:
+        try:
+            src_zip = os.path.join(src_path, zip_file)
+            shutil.copy(src_zip, original_zip_path)
+            with ZipFile(src_zip, 'r') as zip_ref:
+                zip_ref.extractall(raw_unzip_path)
+        except Exception as e:
+            print(f"Failed to unzip {zip_file}: {e}")
+
+    try:
+        # Run global filter
+        excel_path = "./ALL_LOB_Skill_IDS.xlsx"
+        global_filter(raw_unzip_path, folder_to_execute, excel_path, paths)
+
+        # Timestamped filenames
+        for folder in folders:
+            op_path = paths[folder]["op_file_path"]
+            for file in os.listdir(op_path):
+                if file.endswith(".json"):
+                    old_path = os.path.join(op_path, file)
+                    new_name = f"{timestamp_prefix()}.json"
+                    new_path = os.path.join(op_path, new_name)
+                    os.rename(old_path, new_path)
+
+        # Log completion
+        with open(processed_log_file, 'a') as log:
+            log.write(folder_to_execute + "\n")
+        print(f"Completed: {folder_to_execute}")
+
+    except Exception as e:
+        print(f"Error processing folder {folder_to_execute}: {e}")
+
+processing_end_time = datetime.now()
+print(f"Completed all folders. Total time: {processing_end_time - processing_start_time}")
+
+
+
+
+
+
 # Verint Transcript Dynamic Folder Processing Pipeline
 
 import os, shutil
