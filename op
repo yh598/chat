@@ -1,0 +1,21 @@
+from pyspark.sql import DataFrame
+
+def log_partition_sizes(df: DataFrame):
+    print("Estimating rows per partition before writing...")
+    partition_sizes = df.rdd.mapPartitions(lambda it: [sum(1 for _ in it)]).collect()
+    
+    for i, count in enumerate(partition_sizes):
+        print(f"Partition {i}: {count} rows")
+    
+    total = sum(partition_sizes)
+    print(f"Estimated total rows: {total}")
+    return total
+
+# Example: Apply to your DataFrame
+total_rows = log_partition_sizes(df_final)
+
+# Write after confirming partition distribution
+df_final.write \
+    .mode("overwrite") \
+    .option("compression", "snappy") \
+    .parquet(log_file_path)
